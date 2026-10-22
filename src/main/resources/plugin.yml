@@ -1,0 +1,6 @@
+name: mcpaper-siwangbaoliu
+version: 1.0.0
+main: com.adongcraft.siwangbaoliu.SiwangbaoliuPlugin
+api-version: '26.3'
+description: 死亡后把掉落物放进原地的箱子，拿空后箱子消失
+author: adongshaln
