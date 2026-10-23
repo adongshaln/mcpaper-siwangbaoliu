@@ -18,7 +18,9 @@ import org.bukkit.event.Listener;
 import org.bukkit.event.block.BlockBreakEvent;
 import org.bukkit.event.block.BlockExplodeEvent;
 import org.bukkit.event.entity.EntityExplodeEvent;
+import org.bukkit.event.entity.EntityPickupItemEvent;
 import org.bukkit.event.entity.PlayerDeathEvent;
+import org.bukkit.event.player.PlayerInteractEvent;
 import org.bukkit.event.inventory.InventoryClickEvent;
 import org.bukkit.event.inventory.InventoryCloseEvent;
 import org.bukkit.event.inventory.InventoryDragEvent;
@@ -28,6 +30,7 @@ import org.bukkit.event.player.PlayerRespawnEvent;
 import org.bukkit.inventory.Inventory;
 import org.bukkit.inventory.InventoryHolder;
 import org.bukkit.inventory.ItemStack;
+import org.bukkit.inventory.meta.ItemMeta;
 import org.bukkit.persistence.PersistentDataType;
 import org.bukkit.plugin.java.JavaPlugin;
 
@@ -46,24 +49,30 @@ public final class SiwangbaoliuPlugin extends JavaPlugin implements Listener {
 
     private final Map<UUID, Component> pending = new ConcurrentHashMap<>();
     private org.bukkit.NamespacedKey deathChestKey;
+    private org.bukkit.NamespacedKey experienceKey;
 
     @Override
     public void onEnable() {
         deathChestKey = new org.bukkit.NamespacedKey(this, "death_chest");
+        experienceKey = new org.bukkit.NamespacedKey(this, "experience_points");
         Bukkit.getPluginManager().registerEvents(this, this);
         getLogger().info("死亡保留已启用");
     }
 
     @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
     public void onDeath(PlayerDeathEvent event) {
-        if (event.getKeepInventory()) {
-            return;
+        Player player = event.getPlayer();
+        List<ItemStack> packed = event.getKeepInventory() ? new ArrayList<>() : pack(event.getDrops());
+        int points = 0;
+        if (!event.getKeepLevel()) {
+            points = totalExperience(player.getLevel(), player.getExp());
+            if (points > 0) {
+                packed.add(experienceBottle(points));
+            }
         }
-        List<ItemStack> packed = pack(event.getDrops());
         if (packed.isEmpty()) {
             return;
         }
-        Player player = event.getPlayer();
         Block[] placed = placeChests(player.getLocation(), packed.size() > 27);
         if (placed[0] == null) {
             remember(player, Component.text("附近没有能放箱子的位置，物品掉在地上了。", NamedTextColor.RED));
@@ -75,7 +84,16 @@ public final class SiwangbaoliuPlugin extends JavaPlugin implements Listener {
             tag(placed[1], name);
         }
         List<ItemStack> leftover = store(placed, packed);
-        event.getDrops().clear();
+        if (!event.getKeepInventory()) {
+            event.getDrops().clear();
+        }
+        if (points > 0) {
+            event.setShouldDropExperience(false);
+            event.setDroppedExp(0);
+            event.setNewLevel(0);
+            event.setNewExp(0);
+            event.setNewTotalExp(0);
+        }
         for (ItemStack stack : leftover) {
             placed[0].getWorld().dropItemNaturally(placed[0].getLocation().add(0.5, 0.5, 0.5), stack);
         }
@@ -84,8 +102,13 @@ public final class SiwangbaoliuPlugin extends JavaPlugin implements Listener {
         int z = placed[0].getZ();
         String world = placed[0].getWorld().getName();
         String text = leftover.isEmpty()
-                ? "你的物品留在原地的箱子里了：" + world + " " + x + " " + y + " " + z
+                ? "你的物品和经验留在原地的箱子里了：" + world + " " + x + " " + y + " " + z
                 : "箱子装满了，剩下的掉在旁边：" + world + " " + x + " " + y + " " + z;
+        if (points <= 0) {
+            text = leftover.isEmpty()
+                    ? "你的物品留在原地的箱子里了：" + world + " " + x + " " + y + " " + z
+                    : "箱子装满了，剩下的掉在旁边：" + world + " " + x + " " + y + " " + z;
+        }
         remember(player, Component.text(text, NamedTextColor.GOLD));
     }
 
@@ -97,6 +120,45 @@ public final class SiwangbaoliuPlugin extends JavaPlugin implements Listener {
     @EventHandler
     public void onJoin(PlayerJoinEvent event) {
         deliver(event.getPlayer());
+    }
+
+    @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
+    public void onClaimClick(InventoryClickEvent event) {
+        if (!(event.getWhoClicked() instanceof Player player) || experiencePoints(event.getCurrentItem()) == null) {
+            return;
+        }
+        event.setCancelled(true);
+        ItemStack taken = event.getCurrentItem();
+        event.setCurrentItem(null);
+        claimExperience(player, taken);
+        scheduleEmptyCheck(event.getInventory());
+    }
+
+    @EventHandler(ignoreCancelled = true)
+    public void onPickup(EntityPickupItemEvent event) {
+        if (!(event.getEntity() instanceof Player player) || experiencePoints(event.getItem().getItemStack()) == null) {
+            return;
+        }
+        event.setCancelled(true);
+        ItemStack taken = event.getItem().getItemStack().clone();
+        event.getItem().remove();
+        claimExperience(player, taken);
+    }
+
+    @EventHandler(ignoreCancelled = true)
+    public void onUse(PlayerInteractEvent event) {
+        ItemStack used = event.getItem();
+        if (experiencePoints(used) == null) {
+            return;
+        }
+        event.setCancelled(true);
+        Player player = event.getPlayer();
+        claimExperience(player, used);
+        if (event.getHand() == org.bukkit.inventory.EquipmentSlot.OFF_HAND) {
+            player.getInventory().setItemInOffHand(null);
+        } else {
+            player.getInventory().setItemInMainHand(null);
+        }
     }
 
     @EventHandler(ignoreCancelled = true)
@@ -140,6 +202,61 @@ public final class SiwangbaoliuPlugin extends JavaPlugin implements Listener {
     @EventHandler(ignoreCancelled = true)
     public void onEntityExplode(EntityExplodeEvent event) {
         salvage(event.blockList());
+    }
+
+    private ItemStack experienceBottle(int points) {
+        ItemStack bottle = new ItemStack(Material.EXPERIENCE_BOTTLE);
+        ItemMeta meta = bottle.getItemMeta();
+        meta.displayName(Component.text("经验", NamedTextColor.GREEN));
+        meta.lore(List.of(
+                Component.text(points + " 点经验", NamedTextColor.GRAY),
+                Component.text("拿起来会回到身上", NamedTextColor.DARK_GRAY)
+        ));
+        meta.getPersistentDataContainer().set(experienceKey, PersistentDataType.INTEGER, points);
+        bottle.setItemMeta(meta);
+        return bottle;
+    }
+
+    private Integer experiencePoints(ItemStack stack) {
+        if (stack == null || stack.getType() != Material.EXPERIENCE_BOTTLE || !stack.hasItemMeta()) {
+            return null;
+        }
+        return stack.getItemMeta().getPersistentDataContainer().get(experienceKey, PersistentDataType.INTEGER);
+    }
+
+    private void claimExperience(Player player, ItemStack stack) {
+        Integer points = experiencePoints(stack);
+        if (points == null || points <= 0) {
+            return;
+        }
+        player.giveExp(points);
+        player.sendMessage(Component.text("取回了 " + points + " 点经验。", NamedTextColor.GREEN));
+    }
+
+    private static int totalExperience(int level, float progress) {
+        int points = experienceForLevel(level);
+        points += Math.max(0, Math.round(progress * experienceToNext(level)));
+        return points;
+    }
+
+    private static int experienceToNext(int level) {
+        if (level >= 31) {
+            return 9 * level - 158;
+        }
+        if (level >= 16) {
+            return 5 * level - 38;
+        }
+        return 2 * level + 7;
+    }
+
+    private static int experienceForLevel(int level) {
+        if (level <= 16) {
+            return level * level + 6 * level;
+        }
+        if (level <= 31) {
+            return (int) (2.5D * level * level - 40.5D * level + 360);
+        }
+        return (int) (4.5D * level * level - 162.5D * level + 2220);
     }
 
     private void remember(Player player, Component message) {
